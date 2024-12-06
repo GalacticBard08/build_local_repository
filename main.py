@@ -20,6 +20,8 @@ class Arguments:
         --note              -   указывается для более удобного названия полученных файлов ( Например, 18 . Тогда получим: depends_ubuntu18.tar.gz )
         --git_link          -   указан поумолчанию, изменение не требуется
         
+        ВАЖНО! Указанная ОС и ВМ должны совпадать.
+        
         На основной машине должен быть установлен reprepro пакет. Выполни --prepare-repo
         """
         self.parser = argparse.ArgumentParser(description=description, epilog=epilog)
@@ -35,7 +37,7 @@ class Arguments:
         self.parser.add_argument('--username', type=str, required=True, help='Логин для ВМ')
         self.parser.add_argument('--password', type=str, required=True, help='Парол для ВМ')
         self.parser.add_argument('--git_link', type=str, required=False,
-                                 default='git@gitlab-echelon.etecs.ru:akvs2/distrib_dep.git',
+                                 default='git@gitlab-lest.ru:kvs/distrib_dep.git',
                                  help='Ссылка на репозиторий distrib_dep')
         self.parser.add_argument('--prepare-repo', type=str, required=False, help='Установит reprepro пакет')
 
@@ -92,7 +94,7 @@ class GitRepository(ABC):
 class GitClient(GitRepository):
     def clone(self, repo_url, dest_path=''):
         try:
-            result = subprocess.run(
+            subprocess.run(
                 ["git", "clone", repo_url, dest_path],
                 check=True, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
@@ -139,6 +141,16 @@ class LocalFileSystem(FileSystem):
                 data_file.write(packages_info[package_name])
             data_file.close()
         print('Сохранил информацию о пакетах в ' + saved_file)
+
+    @staticmethod
+    def unpack_archive(worked_dir, path_to_archive):
+        try:
+            subprocess.run(["cd", worked_dir, "&&",
+                            "tar", "-szvf", path_to_archive],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print("Архив из ВМ разархивирован")
+        except subprocess.CalledProcessError as e:
+            print("Ошибка при распаковке архива с пакетами: ", e)
 
 
 # Абстракция для работы с SSH
@@ -192,6 +204,8 @@ class SSHConnection(SSHConnectionHandler):
               f"Удаленный путь: {remote_path}"
               f"Сохраняю в {local_path}"
               f"\n")
+        if os.path.exists(local_path):
+            os.remove(local_path)
         self.sftp.get(remote_path, local_path)
 
 
@@ -201,8 +215,8 @@ class PackageDownloader:
         self.ssh_connection = ssh_connection
         self.information_packages = {}
 
-    def download_dependencies(self, listPackages):
-        for package in set(listPackages):
+    def download_dependencies(self, list_packages):
+        for package in set(list_packages):
             if "dotnet-sdk-5.0" == package:
                 print("2")
             print(f"\nРаботаю с : {package}...")
@@ -225,8 +239,59 @@ class PackageDownloader:
 
 
 class BuildRepository:
-    def __init__(self, name_repo, path_to_depends):
-        pass
+    def __init__(self, name_repo, path_to_depends, worked_dir):
+        self.name_repo = name_repo
+        self.depends_catalog = path_to_depends
+        self.repository_catalog = f"{worked_dir}/repo"  # Каталог для промежуточного сохранения пакетов и конвертации в локальный репозиторий
+        self.config_content = """Codename: stable
+        Suite: stable
+        Components: main
+        Architectures: amd64 i386"""
+
+    def _create_repository_catalog(self):
+        try:
+            os.makedirs(f"{self.repository_catalog}/conf")
+            os.makedirs(f"{self.repository_catalog}/incoming")
+            print("Успешно создал каталог для локального репозитория")
+        except OSError as e:
+            print("Ошибка при создании каталога для репозитория: ", e)
+
+    def _create_distributions_file(self):
+        try:
+            with open(f"{self.repository_catalog}/conf/distributions", "w") as config_file:
+                config_file.write(self.config_content)
+                config_file.close()
+            print("Успешно создал конфиг. файл для репозитория")
+        except IOError as e:
+            print(f"Ошибка при создании конфиг. файла: ", e)
+
+    def _added_packages(self):
+        try:
+            subprocess.run(["cd", self.repository_catalog, "&&",
+                            "reprepro", "includedeb", "stable"
+                                                      f"{self.depends_catalog}/*.deb"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print("В репозиторий успешно добавлены пакеты")
+        except subprocess.CalledProcessError as e:
+            print("Ошибка при добавлении пакетов в репозиторий: ", e)
+
+    def _packing_repository(self):
+        try:
+            subprocess.run(["cd", os.path.dirname(self.depends_catalog), "&&",
+                            "tar", "-czvf", os.path.basename(self.repository_catalog), self.name_repo],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print("Успешно создан архив:", os.path.abspath("localrepo"))
+        except subprocess.CalledProcessError as e:
+            print("Ошибка при архивировании: ", e)
+        else:
+            os.remove(self.repository_catalog)
+
+    def initial_repo(self):
+        print("\nНачинаю инициализацию репозитория...")
+        self._create_repository_catalog()
+        self._create_distributions_file()
+        self._added_packages()
+        self._packing_repository()
 
 
 def main():
@@ -238,31 +303,36 @@ def main():
     username = args.username
     password = args.password
 
-    archive_name = f"depends_{os_name}{note}.tar.gz"
-    dirPath = os.getcwd()
+    local_archive_name = f"depends_{os_name}{note}.tar.gz"
+    remote_archive_name = f"packages_from_{os_name}{note}.tar.gz"
+    dir_path = os.getcwd()
 
     # Создание объектов
     git_client = GitClient()
-    git_client.clone(args.git_link, dirPath + "/distrib_dep")
+    git_client.clone(args.git_link, dir_path + "/distrib_dep")
 
     file_system = LocalFileSystem()
-    file_system.search_main_packages(dirPath + "/distrib_dep/linux", dirPath + "/packages.txt", os_name,
+    file_system.search_main_packages(dir_path + "/distrib_dep/linux", dir_path + "/packages.txt", os_name,
                                      release_name=release)
 
     ssh_connection = SSHConnection(hostname, username, password)
     ssh_connection.connect()
-    ssh_connection.run_command(f"rm -rf depends {archive_name} && mkdir -p depends")
+    ssh_connection.run_command(f"rm -rf depends {remote_archive_name} && mkdir -p depends")
 
     package_manager = APTPackageManager()
     package_downloader = PackageDownloader(package_manager, ssh_connection)
     package_downloader.download_dependencies(file_system.listPackages)
 
-    ssh_connection.run_command(f"tar -czvf {archive_name} ~/depends")
+    ssh_connection.run_command(f"cd ~/ && tar -czvf {remote_archive_name} depends")
     ssh_connection.sftp_open()
-    ssh_connection.copy_from_remote(f"/home/echelon/{archive_name}", f"{dirPath}/{archive_name}")
+    ssh_connection.copy_from_remote(f"/home/echelon/{remote_archive_name}", f"{dir_path}/{remote_archive_name}")
     ssh_connection.close()
 
-    file_system.wrie_info_packages(package_downloader.information_packages, f"{dirPath}/depends_{os_name}{note}.txt")
+    file_system.wrie_info_packages(package_downloader.information_packages, f"{dir_path}/depends_{os_name}{note}.txt")
+    file_system.unpack_archive(dir_path, remote_archive_name)
+
+    local_repo = BuildRepository(local_archive_name, f"{dir_path}/depends", dir_path)
+    local_repo.initial_repo()
 
 
 if __name__ == "__main__":
